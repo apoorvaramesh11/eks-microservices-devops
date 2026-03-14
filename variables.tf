@@ -64,3 +64,18 @@ variable "node_groups" {
   }
 }
 
+variable "manage_aws_auth_configmap" {
+  description = "Manage aws-auth configmap"
+  type        = bool
+  default     = true
+}
+
+variable "aws_auth_users" {
+  description = "IAM users to add to aws-auth configmap"
+  type = list(object({
+    userarn  = string
+    username = string
+    groups   = list(string)
+  }))
+  default = []
+}
