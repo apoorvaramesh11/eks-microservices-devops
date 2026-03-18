@@ -68,7 +68,7 @@ module "eks" {
 
 resource "kubernetes_config_map" "aws_auth" {
   metadata {
-    name      = "aws-auth"
+    name      = "aws-auth1"
     namespace = "kube-system"
   }
 
