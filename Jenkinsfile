@@ -2,120 +2,59 @@ pipeline {
     agent any
 
     environment {
-        REGISTRY = "docker.io/yourdockerhub"
-        DOCKER_CREDS = "dockerhub-creds"
+        DOCKER_IMAGE = "product-catalog"
+        DOCKER_TAG = "${BUILD_NUMBER}"
+        DOCKER_REPO = credentials('docker-username') // Jenkins credential ID
+        DOCKER_CREDS = credentials('docker-creds')   // username + password/token
+        GIT_CREDS = credentials('github-creds')
     }
 
     options {
         timestamps()
+        disableConcurrentBuilds()
     }
 
     stages {
 
         stage('Checkout') {
             steps {
-                git 'https://github.com/apoorvaramesh11/eks-microservices-devops.git'
+                git branch: 'main',
+                    credentialsId: 'github-creds',
+                    url: 'https://github.com/your-repo.git'
             }
         }
 
-        stage('Detect Services') {
-            steps {
-                script {
-                    SERVICES = sh(
-                        script: "ls src",
-                        returnStdout: true
-                    ).trim().split("\n")
+        stage('Build & Test') {
+            parallel {
 
-                    echo "Detected services: ${SERVICES}"
-                }
-            }
-        }
-
-        stage('Build Services') {
-            steps {
-                script {
-
-                    def builds = [:]
-
-                    for (svc in SERVICES) {
-
-                        builds[svc] = {
-
-                            stage("Build-${svc}") {
-
-                                dir("src/${svc}") {
-
-                                    sh '''
-                                    echo "Detecting language..."
-
-                                    # Java / Kotlin
-                                    if [ -f pom.xml ] || [ -f build.gradle ]; then
-                                        echo "Java/Kotlin project"
-                                        ./mvnw clean package || mvn clean package || ./gradlew build
-                                    fi
-
-                                    # NodeJS / TypeScript
-                                    if [ -f package.json ]; then
-                                        echo "NodeJS project"
-                                        npm install
-                                        npm run build || true
-                                    fi
-
-                                    # Python
-                                    if [ -f requirements.txt ]; then
-                                        echo "Python project"
-                                        pip install -r requirements.txt
-                                    fi
-
-                                    # Go
-                                    if [ -f go.mod ]; then
-                                        echo "Go project"
-                                        go build
-                                    fi
-
-                                    # .NET
-                                    if ls *.csproj 1> /dev/null 2>&1; then
-                                        echo ".NET project"
-                                        dotnet build
-                                    fi
-
-                                    # Rust
-                                    if [ -f Cargo.toml ]; then
-                                        echo "Rust project"
-                                        cargo build --release
-                                    fi
-
-                                    # Ruby
-                                    if [ -f Gemfile ]; then
-                                        echo "Ruby project"
-                                        bundle install
-                                    fi
-
-                                    # PHP
-                                    if [ -f composer.json ]; then
-                                        echo "PHP project"
-                                        composer install
-                                    fi
-
-                                    # Elixir
-                                    if [ -f mix.exs ]; then
-                                        echo "Elixir project"
-                                        mix deps.get
-                                        mix compile
-                                    fi
-
-                                    # C++
-                                    if ls *.cpp 1> /dev/null 2>&1; then
-                                        echo "C++ project"
-                                        g++ *.cpp -o app || true
-                                    fi
-                                    '''
-                                }
-                            }
-                        }
+                stage('Build') {
+                    steps {
+                        sh '''
+                        cd src/product-catalog
+                        go mod download
+                        go build -o product-catalog-service main.go
+                        '''
                     }
+                }
 
-                    parallel builds
+                stage('Unit Tests') {
+                    steps {
+                        sh '''
+                        cd src/product-catalog
+                        go test ./...
+                        '''
+                    }
+                }
+
+                stage('Lint') {
+                    steps {
+                        sh '''
+                        curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s latest
+                        export PATH=$PATH:$(pwd)/bin
+                        cd src/product-catalog
+                        golangci-lint run
+                        '''
+                    }
                 }
             }
         }
@@ -123,57 +62,63 @@ pipeline {
         stage('Docker Build & Push') {
             steps {
                 script {
-
-                    def dockerStages = [:]
-
-                    for (svc in SERVICES) {
-
-                        dockerStages[svc] = {
-
-                            stage("Docker-${svc}") {
-
-                                dir("src/${svc}") {
-
-                                    withCredentials([usernamePassword(
-                                        credentialsId: DOCKER_CREDS,
-                                        usernameVariable: 'USER',
-                                        passwordVariable: 'PASS'
-                                    )]) {
-
-                                        sh """
-                                        echo \$PASS | docker login -u \$USER --password-stdin
-
-                                        docker build -t $REGISTRY/${svc}:${BUILD_NUMBER} .
-                                        docker push $REGISTRY/${svc}:${BUILD_NUMBER}
-                                        """
-                                    }
-                                }
-                            }
-                        }
+                    docker.withRegistry('https://index.docker.io/v1/', 'docker-creds') {
+                        def app = docker.build("${DOCKER_REPO}/${DOCKER_IMAGE}:${DOCKER_TAG}", "src/product-catalog")
+                        app.push()
                     }
-
-                    parallel dockerStages
                 }
             }
         }
 
-        stage('Deploy') {
+        stage('Update Kubernetes Manifest') {
             steps {
-                sh "kubectl apply -f manifests/"
+                sh '''
+                sed -i "s|image: .*|image: ${DOCKER_REPO}/${DOCKER_IMAGE}:${DOCKER_TAG}|" kubernetes/productcatalog/deploy.yaml
+                '''
+            }
+        }
+
+        stage('Commit & Push Changes') {
+            steps {
+                sh '''
+                git config user.email "ci@jenkins.com"
+                git config user.name "Jenkins CI"
+
+                git add kubernetes/productcatalog/deploy.yaml
+
+                git diff --quiet || git commit -m "[CI]: Update product catalog image tag"
+
+                git push https://${GIT_CREDS_USR}:${GIT_CREDS_PSW}@github.com/your-repo.git HEAD:main
+                '''
+            }
+        }
+
+        // Optional Manual Approval for Production
+        stage('Approval') {
+            when {
+                branch 'main'
+            }
+            steps {
+                input message: "Deploy to Production?"
+            }
+        }
+
+        stage('Deploy to Kubernetes') {
+            steps {
+                sh '''
+                kubectl apply -f kubernetes/productcatalog/deploy.yaml
+                '''
             }
         }
     }
 
     post {
-
         success {
-            echo "All services built successfully"
+            echo "✅ Pipeline completed successfully"
         }
-
         failure {
-            echo "Pipeline failed"
+            echo "❌ Pipeline failed"
         }
-
         always {
             cleanWs()
         }
